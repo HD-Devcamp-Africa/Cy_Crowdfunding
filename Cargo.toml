@@ -1,0 +1,22 @@
+[package]
+name = "crowdfunding"
+version = "0.1.0"
+authors = ["Cynthia"]
+edition = "2021"
+
+[dependencies]
+ink = { version = "5.1.1", default-features = false }
+
+[dev-dependencies]
+ink_e2e = "5.1.1"
+
+[lib]
+name = "crowdfunding"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["std"]
+std = [
+    "ink/std",
+]
