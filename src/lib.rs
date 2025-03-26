@@ -1,210 +1,188 @@
-#![allow(clippy::arithmetic_side_effects)]
+#![no_std]
+use soroban_sdk::{contract, contractimpl, Address, Env, Symbol, Vec, Map, Val, Error};
 
-#[ink::contract]
-mod crowdfunding {
-    use ink::prelude::vec::Vec;
-    use ink::storage::Mapping;
-    use ink::env::caller;
+#[contract]
+pub struct Crowdfunding;
 
-    #[derive(scale::Encode, scale::Decode, Clone, Default)]
-    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
-    pub struct Campaign {
-        creator: AccountId,
-        goal: Balance,
-        deadline: BlockNumber,
-        total_raised: Balance,
-        contributions: Mapping<AccountId, Balance>,
-        contributors: Vec<AccountId>,
-    }
-
-    #[ink(storage)]
-    pub struct Crowdfunding {
-        campaigns: Mapping<u32, Campaign>,
-        campaign_count: u32,
-    }
-
-    #[ink(event)]
-    pub struct CampaignCreated {
-        #[ink(topic)]
-        campaign_id: u32,
-        creator: AccountId,
-        goal: Balance,
-        deadline: BlockNumber,
-    }
-
-    #[ink(event)]
-    pub struct ContributionMade {
-        #[ink(topic)]
-        campaign_id: u32,
-        contributor: AccountId,
-        amount: Balance,
-    }
-
-    #[ink(event)]
-    pub struct RefundIssued {
-        #[ink(topic)]
-        campaign_id: u32,
-        contributor: AccountId,
-        amount: Balance,
-    }
-
-    #[ink(event)]
-    pub struct FundsWithdrawn {
-        #[ink(topic)]
-        campaign_id: u32,
-        creator: AccountId,
-        amount: Balance,
-    }
-
-    impl Crowdfunding {
-        #[ink(constructor)]
-        pub fn new() -> Self {
-            Self {
-                campaigns: Mapping::default(),
-                campaign_count: 0,
-            }
+#[contractimpl]
+impl Crowdfunding {
+    pub fn create_campaign(
+        env: Env,
+        creator: Address,
+        goal: i128,
+        deadline: u64,
+    ) -> Result<u32, Error> {
+        // Initialize storage if needed
+        if !env.storage().has(&Symbol::new(&env, "campaign_count")) {
+            env.storage().set(&Symbol::new(&env, "campaign_count"), &0u32);
         }
 
-        #[ink(message)]
-        pub fn create_campaign(&mut self, goal: Balance, deadline: BlockNumber) -> u32 {
-            let creator = caller::<ink::env::DefaultEnvironment>();
-            let campaign_id = self.campaign_count;
-            let campaign = Campaign {
-                creator,
-                goal,
-                deadline,
-                total_raised: 0,
-                contributions: Mapping::default(),
-                contributors: Vec::new(),
-            };
+        // Get and increment campaign count
+        let mut count: u32 = env.storage().get(&Symbol::new(&env, "campaign_count"))?.unwrap();
+        let campaign_id = count;
+        count += 1;
+        env.storage().set(&Symbol::new(&env, "campaign_count"), &count);
 
-            self.campaigns.insert(campaign_id, &campaign);
-            self.campaign_count += 1;
+        // Create and store campaign
+        let campaign = Campaign {
+            creator: creator.clone(),
+            goal,
+            deadline,
+            total_raised: 0,
+            contributions: Map::new(&env),
+            contributors: Vec::new(&env),
+        };
+        env.storage().set(&campaign_key(&env, campaign_id), &campaign);
 
-            self.env().emit_event(CampaignCreated {
-                campaign_id,
-                creator,
-                goal,
-                deadline,
-            });
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "campaign_created"), campaign_id),
+            (creator, goal, deadline),
+        );
 
-            campaign_id
+        Ok(campaign_id)
+    }
+
+    pub fn contribute(
+        env: Env,
+        contributor: Address,
+        campaign_id: u32,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let mut campaign: Campaign = get_campaign(&env, campaign_id)?;
+
+        // Check campaign deadline
+        if env.ledger().timestamp() > campaign.deadline {
+            return Err(Error::from_contract_error(1)); // Custom error code
         }
 
-        #[ink(message, payable)]
-        pub fn contribute(&mut self, campaign_id: u32) -> Result<(), String> {
-            let mut campaign = self.campaigns.get(campaign_id).ok_or("Campaign not found")?;
-            let contributor = caller::<ink::env::DefaultEnvironment>();
-            let amount = self.env().transferred_value();
+        // Update contribution
+        let current = campaign.contributions.get(contributor.clone()).unwrap_or(0);
+        campaign.contributions.set(contributor.clone(), current + amount);
+        campaign.total_raised += amount;
 
-            if self.env().block_number() > campaign.deadline {
-                return Err("Campaign deadline has passed".to_string());
-            }
-
-            let previous_amount = campaign.contributions.get(contributor).unwrap_or(0);
-            campaign.total_raised = campaign.total_raised.checked_add(amount)
-                .ok_or("Overflow occurred while adding to total_raised")?;
-
-            campaign.contributions.insert(contributor, &(previous_amount + amount));
-            if !campaign.contributors.contains(&contributor) {
-                campaign.contributors.push(contributor);
-            }
-
-            self.env().emit_event(ContributionMade {
-                campaign_id,
-                contributor,
-                amount,
-            });
-
-            self.campaigns.insert(campaign_id, &campaign);
-            Ok(())
+        // Add to contributors list if new
+        if !campaign.contributors.contains(contributor.clone()) {
+            campaign.contributors.push_back(contributor.clone());
         }
 
-        #[ink(message)]
-        pub fn withdraw(&mut self, campaign_id: u32) -> Result<(), String> {
-            let mut campaign = self.campaigns.get(campaign_id).ok_or("Campaign not found")?;
-            let creator = caller::<ink::env::DefaultEnvironment>();
+        // Save updated campaign
+        env.storage().set(&campaign_key(&env, campaign_id), &campaign);
 
-            if creator != campaign.creator {
-                return Err("Only the campaign creator can withdraw funds".to_string());
-            }
-            if campaign.total_raised < campaign.goal {
-                return Err("Campaign did not reach its goal".to_string());
-            }
-            if self.env().block_number() <= campaign.deadline {
-                return Err("Campaign deadline has not passed yet".to_string());
-            }
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "contribution_made"), campaign_id),
+            (contributor, amount),
+        );
 
-            let amount = campaign.total_raised;
-            self.env().transfer(campaign.creator, amount)
-                .map_err(|_| "Transfer failed")?;
+        Ok(())
+    }
+
+    pub fn withdraw(env: Env, caller: Address, campaign_id: u32) -> Result<(), Error> {
+        let mut campaign: Campaign = get_campaign(&env, campaign_id)?;
+
+        // Validate caller is creator
+        if caller != campaign.creator {
+            return Err(Error::from_contract_error(2)); // Unauthorized
+        }
+
+        // Validate campaign succeeded
+        if campaign.total_raised < campaign.goal {
+            return Err(Error::from_contract_error(3)); // Goal not reached
+        }
+
+        // Validate deadline passed
+        if env.ledger().timestamp() <= campaign.deadline {
+            return Err(Error::from_contract_error(4)); // Deadline not passed
+        }
+
+        // Transfer funds (simplified for example)
+        // In real implementation, you'd use the token contract
+        env.transfer(campaign.creator, campaign.total_raised)?;
+
+        // Update campaign state
+        campaign.total_raised = 0;
+        env.storage().set(&campaign_key(&env, campaign_id), &campaign);
+
+        // Emit event
+        env.events().publish(
+            (Symbol::new(&env, "funds_withdrawn"), campaign_id),
+            (caller, campaign.total_raised),
+        );
+
+        Ok(())
+    }
+
+    pub fn refund(env: Env, caller: Address, campaign_id: u32) -> Result<(), Error> {
+        let mut campaign: Campaign = get_campaign(&env, campaign_id)?;
+
+        // Validate deadline passed
+        if env.ledger().timestamp() <= campaign.deadline {
+            return Err(Error::from_contract_error(4)); // Deadline not passed
+        }
+
+        // Validate campaign failed
+        if campaign.total_raised >= campaign.goal {
+            return Err(Error::from_contract_error(5)); // Campaign succeeded
+        }
+
+        // Refund all contributors
+        for i in 0..campaign.contributors.len() {
+            let contributor = campaign.contributors.get(i).unwrap();
+            let amount = campaign.contributions.get(contributor.clone()).unwrap_or(0);
             
-            campaign.total_raised = 0;
-            self.campaigns.insert(campaign_id, &campaign);
-
-            self.env().emit_event(FundsWithdrawn {
-                campaign_id,
-                creator,
-                amount,
-            });
-
-            Ok(())
+            if amount > 0 {
+                env.transfer(contributor.clone(), amount)?;
+                campaign.contributions.set(contributor.clone(), 0);
+            }
         }
 
-        #[ink(message)]
-        pub fn refund(&mut self, campaign_id: u32) -> Result<(), String> {
-            let mut campaign = self.campaigns.get(campaign_id).ok_or("Campaign not found")?;
+        // Update campaign state
+        campaign.total_raised = 0;
+        env.storage().set(&campaign_key(&env, campaign_id), &campaign);
 
-            if self.env().block_number() <= campaign.deadline {
-                return Err("Campaign deadline has not passed yet".to_string());
-            }
-            if campaign.total_raised >= campaign.goal {
-                return Err("Campaign was successful, no refunds needed".to_string());
-            }
-
-            let contributors = campaign.contributors.clone();
-            for contributor in contributors {
-                if let Some(amount) = campaign.contributions.get(contributor) {
-                    if amount > 0 {
-                        self.env().transfer(contributor, amount)
-                            .map_err(|_| "Transfer failed")?;
-                        campaign.contributions.remove(contributor);
-                        self.env().emit_event(RefundIssued {
-                            campaign_id,
-                            contributor,
-                            amount,
-                        });
-                    }
-                }
-            }
-
-            self.campaigns.insert(campaign_id, &campaign);
-            Ok(())
-        }
-
-        #[ink(message)]
-        pub fn is_goal_reached(&self, campaign_id: u32) -> bool {
-            if let Some(campaign) = self.campaigns.get(campaign_id) {
-                return campaign.total_raised >= campaign.goal;
-            }
-            false
-        }
-
-        #[ink(message)]
-        pub fn get_all_campaigns(&self) -> Vec<(u32, AccountId, Balance, BlockNumber, Balance)> {
-            let mut all_campaigns = Vec::new();
-            for campaign_id in 0..self.campaign_count {
-                if let Some(campaign) = self.campaigns.get(campaign_id) {
-                    all_campaigns.push((
-                        campaign_id,
-                        campaign.creator,
-                        campaign.goal,
-                        campaign.deadline,
-                        campaign.total_raised,
-                    ));
-                }
-            }
-            all_campaigns
-        }
+        Ok(())
     }
+
+    pub fn get_campaign_info(env: Env, campaign_id: u32) -> Result<CampaignInfo, Error> {
+        let campaign: Campaign = get_campaign(&env, campaign_id)?;
+        Ok(CampaignInfo {
+            creator: campaign.creator,
+            goal: campaign.goal,
+            deadline: campaign.deadline,
+            total_raised: campaign.total_raised,
+            contributor_count: campaign.contributors.len() as u32,
+        })
+    }
+}
+
+// Helper functions
+fn campaign_key(env: &Env, id: u32) -> Symbol {
+    Symbol::new(env, &format!("campaign_{}", id))
+}
+
+fn get_campaign(env: &Env, id: u32) -> Result<Campaign, Error> {
+    env.storage()
+        .get(&campaign_key(env, id))?
+        .ok_or(Error::from_contract_error(6)) // Campaign not found
+}
+
+// Data structures
+#[derive(Clone, Debug, Eq, PartialEq, soroban_sdk::TryFromVal, soroban_sdk::IntoVal)]
+struct Campaign {
+    creator: Address,
+    goal: i128,
+    deadline: u64,
+    total_raised: i128,
+    contributions: Map<Address, i128>,
+    contributors: Vec<Address>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, soroban_sdk::TryFromVal, soroban_sdk::IntoVal)]
+pub struct CampaignInfo {
+    pub creator: Address,
+    pub goal: i128,
+    pub deadline: u64,
+    pub total_raised: i128,
+    pub contributor_count: u32,
 }
