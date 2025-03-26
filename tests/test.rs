@@ -1,134 +1,142 @@
-#[cfg(test)]
-mod tests {
-    use ink_e2e::build_message;
+#![cfg(test)]
+use soroban_sdk::{Env, Address, Error, Symbol, Val};
 
-    use crowdfunding::Crowdfunding;
+use crate::{Crowdfunding, CrowdfundingClient, CampaignInfo};
 
-    type E2EResult<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+#[test]
+fn test_create_campaign() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, Crowdfunding);
+    let client = CrowdfundingClient::new(&env, &contract_id);
 
-    #[ink_e2e::test]
-    async fn test_create_campaign(mut client: ink_e2e::Client<C, E>) -> E2EResult<()> {
-        // Deploy the contract
-        let constructor = Crowdfunding::new(1000, 100); // Goal: 1000, Deadline: Block 100
-        let contract = client
-            .instantiate("crowdfunding", &ink_e2e::alice(), constructor)
-            .submit()
-            .await
-            .expect("Failed to instantiate contract");
-        let mut call = contract.call::<Crowdfunding>();
+    let creator = Address::random(&env);
+    let goal = 1000;
+    let deadline = 100;
 
-        // Check initial state
-        let goal = call.get_goal().dry_run().await?;
-        assert_eq!(goal, 1000);
+    // Create first campaign
+    let campaign_id = client.create_campaign(&creator, &goal, &deadline);
+    assert_eq!(campaign_id, 0);
 
-        let deadline = call.get_deadline().dry_run().await?;
-        assert_eq!(deadline, 100);
+    // Verify campaign info
+    let info = client.get_campaign_info(&campaign_id);
+    assert_eq!(info.creator, creator);
+    assert_eq!(info.goal, goal);
+    assert_eq!(info.deadline, deadline);
+    assert_eq!(info.total_raised, 0);
+    assert_eq!(info.contributor_count, 0);
 
-        let total_raised = call.get_total_raised().dry_run().await?;
-        assert_eq!(total_raised, 0);
+    // Check event
+    let events = env.events().all();
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0].0,
+        (Symbol::new(&env, "campaign_created"), 0u32).into_val(&env)
+    );
+}
 
-        Ok(())
-    }
+#[test]
+fn test_contribute() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, Crowdfunding);
+    let client = CrowdfundingClient::new(&env, &contract_id);
 
-    #[ink_e2e::test]
-    async fn test_contribute(mut client: ink_e2e::Client<C, E>) -> E2EResult<()> {
-        // Deploy the contract
-        let constructor = Crowdfunding::new(1000, 100); // Goal: 1000, Deadline: Block 100
-        let contract = client
-            .instantiate("crowdfunding", &ink_e2e::alice(), constructor)
-            .submit()
-            .await
-            .expect("Failed to instantiate contract");
-        let mut call = contract.call::<Crowdfunding>();
+    let creator = Address::random(&env);
+    let contributor = Address::random(&env);
+    let goal = 1000;
+    let deadline = 100;
 
-        // Alice contributes 500
-        let contribute = build_message::<Crowdfunding>(contract.account_id.clone())
-            .call(|crowdfunding| crowdfunding.contribute());
-        client
-            .call(&ink_e2e::alice(), contribute, 500, None)
-            .await
-            .expect("Failed to call contribute");
+    // Create campaign
+    let campaign_id = client.create_campaign(&creator, &goal, &deadline);
 
-        // Check total raised
-        let total_raised = call.get_total_raised().dry_run().await?;
-        assert_eq!(total_raised, 500);
+    // Contribute
+    let amount = 500;
+    client.contribute(&contributor, &campaign_id, &amount);
 
-        Ok(())
-    }
+    // Verify campaign info
+    let info = client.get_campaign_info(&campaign_id);
+    assert_eq!(info.total_raised, amount);
+    assert_eq!(info.contributor_count, 1);
 
-    #[ink_e2e::test]
-    async fn test_withdraw_success(mut client: ink_e2e::Client<C, E>) -> E2EResult<()> {
-        // Deploy the contract
-        let constructor = Crowdfunding::new(1000, 100); // Goal: 1000, Deadline: Block 100
-        let contract = client
-            .instantiate("crowdfunding", &ink_e2e::alice(), constructor)
-            .submit()
-            .await
-            .expect("Failed to instantiate contract");
-        let mut call = contract.call::<Crowdfunding>();
+    // Check event
+    let events = env.events().all();
+    assert_eq!(events.len(), 2); // creation + contribution
+}
 
-        // Alice contributes 1000 (meets the goal)
-        let contribute = build_message::<Crowdfunding>(contract.account_id.clone())
-            .call(|crowdfunding| crowdfunding.contribute());
-        client
-            .call(&ink_e2e::alice(), contribute, 1000, None)
-            .await
-            .expect("Failed to call contribute");
+#[test]
+fn test_withdraw_success() {
+    let env = Env::default();
+    env.ledger().set_timestamp(50); // Set initial time
+    let contract_id = env.register_contract(None, Crowdfunding);
+    let client = CrowdfundingClient::new(&env, &contract_id);
 
-        // Fast-forward to after the deadline
-        client
-            .advance_block()
-            .await
-            .expect("Failed to advance block");
+    let creator = Address::random(&env);
+    let goal = 1000;
+    let deadline = 100;
 
-        // Alice withdraws funds
-        let withdraw = build_message::<Crowdfunding>(contract.account_id.clone())
-            .call(|crowdfunding| crowdfunding.withdraw());
-        client
-            .call(&ink_e2e::alice(), withdraw, 0, None)
-            .await
-            .expect("Failed to call withdraw");
+    // Create campaign
+    let campaign_id = client.create_campaign(&creator, &goal, &deadline);
 
-        Ok(())
-    }
+    // Fully fund the campaign
+    client.contribute(&creator, &campaign_id, &goal);
 
-    #[ink_e2e::test]
-    async fn test_refund(mut client: ink_e2e::Client<C, E>) -> E2EResult<()> {
-        // Deploy the contract
-        let constructor = Crowdfunding::new(1000, 100); // Goal: 1000, Deadline: Block 100
-        let contract = client
-            .instantiate("crowdfunding", &ink_e2e::alice(), constructor)
-            .submit()
-            .await
-            .expect("Failed to instantiate contract");
-        let mut call = contract.call::<Crowdfunding>();
+    // Advance time past deadline
+    env.ledger().set_timestamp(deadline + 1);
 
-        // Alice contributes 500
-        let contribute = build_message::<Crowdfunding>(contract.account_id.clone())
-            .call(|crowdfunding| crowdfunding.contribute());
-        client
-            .call(&ink_e2e::alice(), contribute, 500, None)
-            .await
-            .expect("Failed to call contribute");
+    // Withdraw funds
+    client.withdraw(&creator, &campaign_id);
 
-        // Fast-forward to after the deadline
-        client
-            .advance_block()
-            .await
-            .expect("Failed to advance block");
+    // Verify campaign state
+    let info = client.get_campaign_info(&campaign_id);
+    assert_eq!(info.total_raised, 0);
+}
 
-        // Alice requests a refund
-        let refund = build_message::<Crowdfunding>(contract.account_id.clone())
-            .call(|crowdfunding| crowdfunding.refund());
-        client
-            .call(&ink_e2e::alice(), refund, 0, None)
-            .await
-            .expect("Failed to call refund");
+#[test]
+fn test_refund() {
+    let env = Env::default();
+    env.ledger().set_timestamp(50);
+    let contract_id = env.register_contract(None, Crowdfunding);
+    let client = CrowdfundingClient::new(&env, &contract_id);
 
-        // Check total raised (should be 0 after refund)
-        let total_raised = call.get_total_raised().dry_run().await?;
-        assert_eq!(total_raised, 0);
+    let creator = Address::random(&env);
+    let contributor = Address::random(&env);
+    let goal = 1000;
+    let deadline = 100;
 
-        Ok(())
-    }
+    // Create campaign
+    let campaign_id = client.create_campaign(&creator, &goal, &deadline);
+
+    // Partial contribution
+    client.contribute(&contributor, &campaign_id, &500);
+
+    // Advance time past deadline
+    env.ledger().set_timestamp(deadline + 1);
+
+    // Request refund
+    client.refund(&contributor, &campaign_id);
+
+    // Verify campaign state
+    let info = client.get_campaign_info(&campaign_id);
+    assert_eq!(info.total_raised, 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(ContractError(1))")] // Deadline passed
+fn test_contribute_after_deadline() {
+    let env = Env::default();
+    env.ledger().set_timestamp(50);
+    let contract_id = env.register_contract(None, Crowdfunding);
+    let client = CrowdfundingClient::new(&env, &contract_id);
+
+    let creator = Address::random(&env);
+    let goal = 1000;
+    let deadline = 100;
+
+    // Create campaign with short deadline
+    let campaign_id = client.create_campaign(&creator, &goal, &deadline);
+
+    // Advance time past deadline
+    env.ledger().set_timestamp(deadline + 1);
+
+    // Try to contribute (should fail)
+    client.contribute(&creator, &campaign_id, &500);
 }
